@@ -25,6 +25,9 @@ Interactive Systems: Integrates with IoT devices to enable advanced human-comput
 Project Structure
 
 Dataset: Description and preprocessing of the datasets used for training and validation.
+
 Model Training: Detailed explanation of the training process for YOLOv7 and CNN models.
+
 Results: Presentation of the model's performance metrics and validation outputs.
+
 Visualization: Tools for visualizing detection results and activity recognition data.
