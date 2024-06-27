@@ -10,6 +10,7 @@ from scipy.ndimage import gaussian_filter
 import time
 import pickle
 import json
+from collections import defaultdict
 
 # Define custom object scope for Mean Squared Error and Mean Absolute Error
 @tf.keras.utils.register_keras_serializable()
@@ -29,7 +30,7 @@ detect_model = tf.keras.models.load_model("model_detect.h5", custom_objects=cust
 activity_model = tf.keras.models.load_model('activity_model.h5')
 
 # Load the class indices for activity recognition
-with open('class_indices.json', 'r') as f:
+with open('class_labels.json', 'r') as f:
     class_indices = json.load(f)
 
 # Initialize the Deep SORT tracker
@@ -88,6 +89,7 @@ def process_video_realtime(video_stream, output_path=r"C:\Users\Adarsh\OneDrive\
     heatmap = np.zeros((target_height, target_width), dtype=np.float32)
     frame_data = []
     start_time = time.time()
+    person_activities = defaultdict(list)
 
     while True:
         ret, frame = video_stream.read()
@@ -110,6 +112,7 @@ def process_video_realtime(video_stream, output_path=r"C:\Users\Adarsh\OneDrive\
             cv2.rectangle(frame, (int(x1), int(y1) - label_height - baseline), (int(x1) + label_width, int(y1)), (0, 255, 0), -1)
             cv2.putText(frame, label, (int(x1), int(y1) - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
             heatmap[int(y1):int(y2), int(x1):int(x2)] += 1
+            person_activities[idx].append(activity_label)
 
         frame_count_label = f'Frame Count: {people_count}'
         total_count_label = f'Total Count: {max_people_count}'
@@ -138,6 +141,13 @@ def process_video_realtime(video_stream, output_path=r"C:\Users\Adarsh\OneDrive\
     cv2.imwrite(heatmap_output_path, heatmap_color)
 
     print(f'Total people detected in the video: {max_people_count}')
+
+    # Create summary document
+    summary_document = 'summary_rl.txt'
+    with open(summary_document, 'w') as f:
+        f.write(f'Total persons detected in the video: {len(person_activities)}\n\n')
+        for person_id, activities in person_activities.items():
+            f.write(f'Person {person_id} - Activities: {", ".join(set(activities))}\n')
 
     with open('frame_data_rl.pkl', 'wb') as f:
         pickle.dump(frame_data, f)
