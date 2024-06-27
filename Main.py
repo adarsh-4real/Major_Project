@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import torch
 import tensorflow as tf
-from tensorflow.keras.losses import MeanSquaredError, MeanAbsoluteError  # type: ignore
+from tensorflow.keras.losses import MeanSquaredError, MeanAbsoluteError #type: ignore
 from models.experimental import attempt_load
 from utils.general import non_max_suppression, scale_coords
 from utils.datasets import letterbox
@@ -12,6 +12,8 @@ import time
 import os
 import pickle
 import json
+from collections import defaultdict
+from scipy.spatial import distance as dist
 
 # Register custom objects
 @tf.keras.utils.register_keras_serializable()
@@ -34,7 +36,7 @@ yolov7_model = attempt_load('yolov7.pt', map_location='cuda' if torch.cuda.is_av
 activity_model = tf.keras.models.load_model('activity_model.h5')
 
 # Load the class indices for activity recognition
-with open('class_indices.json', 'r') as f:
+with open('class_labels.json', 'r') as f:
     class_indices = json.load(f)
 
 # Function to preprocess the image for activity recognition
@@ -80,6 +82,76 @@ def detect_people_with_yolov7(frame, model, img_size=640):
                 boxes.append((int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])))
     return boxes
 
+# Centroid Tracker
+class CentroidTracker:
+    def __init__(self, maxDisappeared=50):
+        self.nextObjectID = 0
+        self.objects = {}
+        self.disappeared = {}
+        self.maxDisappeared = maxDisappeared
+
+    def register(self, centroid):
+        self.objects[self.nextObjectID] = centroid
+        self.disappeared[self.nextObjectID] = 0
+        self.nextObjectID += 1
+
+    def deregister(self, objectID):
+        del self.objects[objectID]
+        del self.disappeared[objectID]
+
+    def update(self, rects):
+        if len(rects) == 0:
+            for objectID in list(self.disappeared.keys()):
+                self.disappeared[objectID] += 1
+                if self.disappeared[objectID] > self.maxDisappeared:
+                    self.deregister(objectID)
+            return self.objects
+
+        inputCentroids = np.zeros((len(rects), 2), dtype="int")
+        for (i, (startX, startY, endX, endY)) in enumerate(rects):
+            cX = int((startX + endX) / 2.0)
+            cY = int((startY + endY) / 2.0)
+            inputCentroids[i] = (cX, cY)
+
+        if len(self.objects) == 0:
+            for i in range(0, len(inputCentroids)):
+                self.register(inputCentroids[i])
+        else:
+            objectIDs = list(self.objects.keys())
+            objectCentroids = list(self.objects.values())
+
+            D = dist.cdist(np.array(objectCentroids), inputCentroids)
+            rows = D.min(axis=1).argsort()
+            cols = D.argmin(axis=1)[rows]
+
+            usedRows = set()
+            usedCols = set()
+            for (row, col) in zip(rows, cols):
+                if row in usedRows or col in usedCols:
+                    continue
+
+                objectID = objectIDs[row]
+                self.objects[objectID] = inputCentroids[col]
+                self.disappeared[objectID] = 0
+
+                usedRows.add(row)
+                usedCols.add(col)
+
+            unusedRows = set(range(0, D.shape[0])).difference(usedRows)
+            unusedCols = set(range(0, D.shape[1])).difference(usedCols)
+
+            if D.shape[0] >= D.shape[1]:
+                for row in unusedRows:
+                    objectID = objectIDs[row]
+                    self.disappeared[objectID] += 1
+                    if self.disappeared[objectID] > self.maxDisappeared:
+                        self.deregister(objectID)
+            else:
+                for col in unusedCols:
+                    self.register(inputCentroids[col])
+
+        return self.objects
+
 # Function to process the video
 def process_video(input_video_path, output_video_path, heatmap_output_path):
     if not os.path.isfile(input_video_path):
@@ -107,6 +179,9 @@ def process_video(input_video_path, output_video_path, heatmap_output_path):
     frame_data = []
     start_time = time.time()
 
+    ct = CentroidTracker(maxDisappeared=40)
+    person_activities = defaultdict(list)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -117,18 +192,30 @@ def process_video(input_video_path, output_video_path, heatmap_output_path):
         people_count = len(boxes)
         max_people_count = max(max_people_count, people_count)
 
+        rects = []
+        for (x1, y1, x2, y2) in boxes:
+            rects.append((x1, y1, x2, y2))
+
+        objects = ct.update(rects)
         activity_labels = []
-        for idx, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+
+        for (objectID, centroid) in objects.items():
+            if objectID >= len(boxes):
+                continue
+            x1, y1, x2, y2 = boxes[objectID]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             person_crop = frame[y1:y2, x1:x2]
             activity_label = predict_activity(activity_model, person_crop, class_indices)
             activity_labels.append(activity_label)
 
-            label = f'Person {idx}: {activity_label}'
+            label = f'Person {objectID}: {activity_label}'
             (label_width, label_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(frame, (x1, y1 - label_height - baseline), (x1 + label_width, y1), (0, 255, 0), -1)
             cv2.putText(frame, label, (x1, y1 - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
             heatmap[y1:y2, x1:x2] += 1
+
+            person_activities[objectID].append(activity_label)
 
         frame_count_label = f'Frame Count: {people_count}'
         total_count_label = f'Total Count: {max_people_count}'
@@ -153,6 +240,13 @@ def process_video(input_video_path, output_video_path, heatmap_output_path):
     cv2.imwrite(heatmap_output_path, heatmap_color)
 
     print(f'Total people detected in the video: {max_people_count}')
+
+    # Create summary document
+    summary_document = 'summary.txt'
+    with open(summary_document, 'w') as f:
+        f.write(f'Total persons detected in the {input_video_path} video: {len(person_activities)}\n\n')
+        for person_id, activities in person_activities.items():
+            f.write(f'Person {person_id} - Activities: {", ".join(set(activities))}\n')
 
     return frame_data
 
